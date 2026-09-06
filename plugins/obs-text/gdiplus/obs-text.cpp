@@ -5,10 +5,14 @@
 #include <sys/stat.h>
 #include <combaseapi.h>
 #include <gdiplus.h>
+#include <dwrite.h>
+#include <wrl/client.h>
 #include <algorithm>
 #include <string>
 #include <memory>
 #include <locale>
+#include <cwctype>
+#include <cwchar>
 
 using namespace std;
 using namespace Gdiplus;
@@ -152,6 +156,18 @@ static inline wstring to_wide(const char *utf8)
 	return text;
 }
 
+static inline string to_utf8(const wstring &wide)
+{
+	string text;
+
+	size_t len = os_wcs_to_utf8(wide.c_str(), 0, nullptr, 0);
+	text.resize(len);
+	if (len)
+		os_wcs_to_utf8(wide.c_str(), 0, &text[0], len + 1);
+
+	return text;
+}
+
 static inline uint32_t rgb_to_bgr(uint32_t rgb)
 {
 	return ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb & 0xFF0000) >> 16);
@@ -226,7 +242,9 @@ struct TextSource {
 
 	wstring text;
 	wstring face;
+	wstring style;
 	int face_size = 0;
+	LONG weight = 0;
 	uint32_t color = 0xFFFFFF;
 	uint32_t color2 = 0xFFFFFF;
 	float gradient_dir = 0;
@@ -305,6 +323,154 @@ static time_t get_modified_timestamp(const char *filename)
 	return stats.st_mtime;
 }
 
+/* lfFaceName is a WCHAR[LF_FACESIZE] buffer; copy with truncation so an
+ * over-long family name can never overrun it, and always NUL-terminate. */
+static inline void set_face_name(WCHAR (&dst)[LF_FACESIZE], const wstring &name)
+{
+	wcsncpy_s(dst, LF_FACESIZE, name.c_str(), _TRUNCATE);
+}
+
+/* Map an OpenType style/subfamily name (e.g. "Light", "SemiBold", "Heavy") to a
+ * GDI weight.  The name is normalized (lowercased, spaces and hyphens stripped)
+ * before substring matching, so "Extra Bold" and "ExtraBold" alias; the more
+ * specific keywords are tested first.  Returns 0 when the style names no explicit
+ * weight. */
+static LONG style_to_weight(const wstring &style)
+{
+	wstring s;
+	s.reserve(style.size());
+	for (wchar_t c : style) {
+		if (c == L' ' || c == L'-')
+			continue;
+		s.push_back((wchar_t)towlower(c));
+	}
+
+	auto has = [&s](const wchar_t *sub) {
+		return s.find(sub) != wstring::npos;
+	};
+
+	if (has(L"thin"))
+		return FW_THIN;
+	if (has(L"extralight") || has(L"ultralight"))
+		return FW_EXTRALIGHT;
+	if (has(L"semibold") || has(L"demibold"))
+		return FW_SEMIBOLD;
+	if (has(L"extrabold") || has(L"ultrabold"))
+		return FW_EXTRABOLD;
+	if (has(L"light"))
+		return FW_LIGHT;
+	if (has(L"medium"))
+		return FW_MEDIUM;
+	if (has(L"black") || has(L"heavy"))
+		return FW_BLACK; /* FW_BLACK == FW_HEAVY */
+	if (has(L"bold"))
+		return FW_BOLD;
+
+	return 0;
+}
+
+/* Read back the physical family GDI actually mapped a font to (via
+ * GetOutlineTextMetricsW, which reports the post-substitution face).
+ * otmpFamilyName is a byte offset from the buffer start, not a real pointer. */
+static wstring get_physical_family(HDC hdc, HFONT hfont)
+{
+	wstring result;
+
+	if (!hdc || !hfont)
+		return result;
+
+	HGDIOBJ prev = SelectObject(hdc, hfont);
+
+	UINT size = GetOutlineTextMetricsW(hdc, 0, nullptr);
+	if (size) {
+		unique_ptr<BYTE[]> buffer(new BYTE[size]);
+		OUTLINETEXTMETRICW *otm = reinterpret_cast<OUTLINETEXTMETRICW *>(buffer.get());
+
+		if (GetOutlineTextMetricsW(hdc, size, otm) && otm->otmpFamilyName) {
+			const WCHAR *name = reinterpret_cast<const WCHAR *>(
+				buffer.get() + reinterpret_cast<UINT_PTR>(otm->otmpFamilyName));
+			result = name;
+		}
+	}
+
+	SelectObject(hdc, prev);
+	return result;
+}
+
+/* Case-insensitive prefix match: tolerates a legacy family that embeds a weight
+ * suffix (requesting "Foo", resolving "Foo Light") while still rejecting an
+ * unrelated substitution. */
+static bool family_hit(const wstring &physical, const wstring &face)
+{
+	if (physical.empty() || face.empty())
+		return false;
+	if (physical.size() < face.size())
+		return false;
+
+	return _wcsnicmp(physical.c_str(), face.c_str(), face.size()) == 0;
+}
+
+/* Qt stores the DirectWrite family name (typographic/English/localized) that
+ * GDI's legacy-only CreateFontIndirect (name ID 1) may not map, so DirectWrite
+ * resolves it and GdiInterop yields a GDI-renderable LOGFONT name (empty on
+ * failure).  DWriteCreateFactory needs no CoInitialize; ComPtr frees COM. */
+static wstring dwrite_resolve_family(const wstring &face, LONG weight, bool italic)
+{
+	using Microsoft::WRL::ComPtr;
+
+	if (face.empty())
+		return wstring();
+
+	ComPtr<IDWriteFactory> factory;
+	HRESULT hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+					 reinterpret_cast<IUnknown **>(factory.GetAddressOf()));
+	if (FAILED(hr) || !factory)
+		return wstring();
+
+	ComPtr<IDWriteFontCollection> collection;
+	hr = factory->GetSystemFontCollection(collection.GetAddressOf());
+	if (FAILED(hr) || !collection)
+		return wstring();
+
+	UINT32 index = 0;
+	BOOL exists = FALSE;
+	hr = collection->FindFamilyName(face.c_str(), &index, &exists);
+	if (FAILED(hr) || !exists)
+		return wstring();
+
+	ComPtr<IDWriteFontFamily> family;
+	hr = collection->GetFontFamily(index, family.GetAddressOf());
+	if (FAILED(hr) || !family)
+		return wstring();
+
+	/* GDI FW_* and DWRITE_FONT_WEIGHT share the 100-900 numeric range, so the
+	 * mapped weight carries over directly; fall back to Normal only when no
+	 * weight was derived. */
+	DWRITE_FONT_WEIGHT dweight = weight ? (DWRITE_FONT_WEIGHT)weight : DWRITE_FONT_WEIGHT_NORMAL;
+
+	ComPtr<IDWriteFont> font;
+	hr = family->GetFirstMatchingFont(dweight, DWRITE_FONT_STRETCH_NORMAL,
+					  italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
+					  font.GetAddressOf());
+	if (FAILED(hr) || !font)
+		return wstring();
+
+	ComPtr<IDWriteGdiInterop> interop;
+	hr = factory->GetGdiInterop(interop.GetAddressOf());
+	if (FAILED(hr) || !interop)
+		return wstring();
+
+	LOGFONTW logfont = {};
+	BOOL is_system_font = FALSE;
+	hr = interop->ConvertFontToLOGFONT(font.Get(), &logfont, &is_system_font);
+	if (FAILED(hr))
+		return wstring();
+
+	/* lfFaceName is a fixed WCHAR[LF_FACESIZE] buffer that ConvertFontToLOGFONT
+	 * NUL-terminates. */
+	return wstring(logfont.lfFaceName);
+}
+
 void TextSource::UpdateFont()
 {
 	hfont = nullptr;
@@ -312,25 +478,81 @@ void TextSource::UpdateFont()
 
 	LOGFONT lf = {};
 	lf.lfHeight = face_size;
-	lf.lfWeight = bold ? FW_BOLD : FW_DONTCARE;
 	lf.lfItalic = italic;
 	lf.lfUnderline = underline;
 	lf.lfStrikeOut = strikeout;
 	lf.lfQuality = ANTIALIASED_QUALITY;
 	lf.lfCharSet = DEFAULT_CHARSET;
 
+	/* Prefer the exact numeric weight the frontend stored (QFont::weight()),
+	 * which is immune to arbitrary variant naming.  Fall back to deriving it
+	 * from the OpenType style name for older sources that lack the field, so
+	 * Light/Medium/Heavy and friends still survive; the Bold flag only forces
+	 * FW_BOLD when neither yields a weight. */
+	LONG weight = this->weight;
+	if (weight == 0)
+		weight = style_to_weight(style);
+	if (weight == 0)
+		weight = bold ? FW_BOLD : FW_DONTCARE;
+	lf.lfWeight = weight;
+
+	HFONT selected = nullptr;
+	wstring requested_physical;
+	bool matched = false;
+
 	if (!face.empty()) {
-		wcscpy(lf.lfFaceName, face.c_str());
-		hfont = CreateFontIndirect(&lf);
+		/* Attempt 1: request the typographic/family name as stored. */
+		set_face_name(lf.lfFaceName, face);
+		selected = CreateFontIndirect(&lf);
+		requested_physical = get_physical_family(hdc, selected);
+		matched = family_hit(requested_physical, face);
+
+		/* Attempt 2: the stored face is a DirectWrite name GDI could not resolve,
+		 * so map it to a legacy name and rebuild; trust a successful resolution
+		 * directly (its physical name may be a Chinese legacy family for English). */
+		if (!matched) {
+			wstring resolved = dwrite_resolve_family(face, weight, italic);
+			if (!resolved.empty()) {
+				LOGFONT lf2 = lf;
+				set_face_name(lf2.lfFaceName, resolved);
+
+				HFONT dwritten = CreateFontIndirect(&lf2);
+				if (dwritten) {
+					if (selected)
+						DeleteObject(selected);
+					selected = dwritten;
+					requested_physical = get_physical_family(hdc, selected);
+					matched = true;
+				}
+			}
+		}
 	}
 
-	if (!hfont) {
-		wcscpy(lf.lfFaceName, L"Arial");
-		hfont = CreateFontIndirect(&lf);
+	/* Preserve the historical fallback: only replace with Arial when GDI could
+	 * not create any font at all.  A created-but-substituted font is kept (and
+	 * reported below) rather than discarded, so fonts that already worked keep
+	 * working. */
+	if (!selected) {
+		set_face_name(lf.lfFaceName, L"Arial");
+		selected = CreateFontIndirect(&lf);
 	}
 
-	if (hfont)
+	hfont = selected;
+
+	Status status = Ok;
+	if (hfont) {
 		font.reset(new Font(hdc, hfont));
+		status = font->GetLastStatus();
+	}
+
+	/* Surface silent GDI substitutions and GDI+ font failures, which are
+	 * otherwise invisible: a mismatched family means the requested face was
+	 * quietly replaced. */
+	if ((!face.empty() && !matched && !requested_physical.empty()) || status != Ok) {
+		warning("GDI font mapping: requested face='%s' style='%s' -> resolved '%s' (gdiplus status %d)",
+			to_utf8(face).c_str(), to_utf8(style).c_str(), to_utf8(requested_physical).c_str(),
+			(int)status);
+	}
 }
 
 void TextSource::GetStringFormat(StringFormat &format)
@@ -727,8 +949,10 @@ inline void TextSource::Update(obs_data_t *s)
 	bool new_antialiasing = obs_data_get_bool(s, S_ANTIALIASING);
 
 	const char *font_face = obs_data_get_string(font_obj, "face");
+	const char *font_style = obs_data_get_string(font_obj, "style");
 	int font_size = (int)obs_data_get_int(font_obj, "size");
 	int64_t font_flags = obs_data_get_int(font_obj, "flags");
+	int new_weight = (int)obs_data_get_int(font_obj, "weight");
 	bool new_bold = (font_flags & OBS_FONT_BOLD) != 0;
 	bool new_italic = (font_flags & OBS_FONT_ITALIC) != 0;
 	bool new_underline = (font_flags & OBS_FONT_UNDERLINE) != 0;
@@ -740,12 +964,15 @@ inline void TextSource::Update(obs_data_t *s)
 	/* ----------------------------- */
 
 	wstring new_face = to_wide(font_face);
+	wstring new_style = to_wide(font_style);
 
-	if (new_face != face || face_size != font_size || new_bold != bold || new_italic != italic ||
-	    new_underline != underline || new_strikeout != strikeout) {
+	if (new_face != face || new_style != style || face_size != font_size || new_weight != weight ||
+	    new_bold != bold || new_italic != italic || new_underline != underline || new_strikeout != strikeout) {
 
 		face = new_face;
+		style = new_style;
 		face_size = font_size;
+		weight = new_weight;
 		bold = new_bold;
 		italic = new_italic;
 		underline = new_underline;
