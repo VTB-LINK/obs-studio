@@ -835,6 +835,7 @@ void MakeQFont(obs_data_t *font_obj, QFont &font, bool limit = false)
 	const char *style = obs_data_get_string(font_obj, "style");
 	int size = (int)obs_data_get_int(font_obj, "size");
 	uint32_t flags = (uint32_t)obs_data_get_int(font_obj, "flags");
+	int weight = (int)obs_data_get_int(font_obj, "weight");
 
 	if (face) {
 		font.setFamily(face);
@@ -852,7 +853,9 @@ void MakeQFont(obs_data_t *font_obj, QFont &font, bool limit = false)
 		font.setPointSize(size);
 	}
 
-	if (flags & OBS_FONT_BOLD)
+	if (weight > 0)
+		font.setWeight(static_cast<QFont::Weight>(weight));
+	else if (flags & OBS_FONT_BOLD)
 		font.setBold(true);
 	if (flags & OBS_FONT_ITALIC)
 		font.setItalic(true);
@@ -1887,6 +1890,7 @@ bool WidgetInfo::FontChanged(const char *setting)
 	flags |= font.underline() ? OBS_FONT_UNDERLINE : 0;
 	flags |= font.strikeOut() ? OBS_FONT_STRIKEOUT : 0;
 	obs_data_set_int(font_obj, "flags", flags);
+	obs_data_set_int(font_obj, "weight", font.weight());
 
 	QLabel *label = static_cast<QLabel *>(widget);
 	QFont labelFont;
